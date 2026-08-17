@@ -1,11 +1,20 @@
 """Local configuration and source parsing for Telegram Digest."""
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Mapping
 from urllib.parse import urlparse
+import argparse
+import asyncio
+import os
 import re
+import sys
+
+try:
+    from openai import OpenAI
+except ModuleNotFoundError:
+    OpenAI = None
 
 
 class ConfigError(ValueError):
@@ -14,6 +23,10 @@ class ConfigError(ValueError):
 
 class CollectionError(ValueError):
     """Raised when a requested Telegram source is not a public broadcast channel."""
+
+
+class GenerationError(ValueError):
+    """Raised when the model returns no usable digest text."""
 
 
 @dataclass(frozen=True)
@@ -42,6 +55,16 @@ REQUIRED_SETTINGS = (
     "OPENAI_MODEL",
 )
 USERNAME_RE = re.compile(r"[A-Za-z0-9_]+$")
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def _openai_client_factory() -> Callable[..., object]:
+    if OpenAI is None:
+        from openai import OpenAI as imported_openai
+
+        return imported_openai
+
+    return OpenAI
 
 
 def _read_text(root: Path, filename: str) -> str:
@@ -232,3 +255,131 @@ def format_posts(posts: list[Post]) -> str:
             f"Text:\n{post.text}"
         )
     return "Telegram posts collected:\n\n" + "\n\n".join(blocks)
+
+
+def generate_digest(
+    settings: Settings,
+    prompt: str,
+    formatted_posts: str,
+    *,
+    client_factory: Callable[..., object] | None = OpenAI,
+) -> str:
+    """Request one Markdown digest from the configured OpenAI-compatible API."""
+    factory = client_factory or _openai_client_factory()
+    client = factory(
+        base_url=settings.openai_base_url,
+        api_key=settings.openai_api_key,
+        max_retries=0,
+    )
+    response = client.chat.completions.create(
+        model=settings.openai_model,
+        messages=[
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": formatted_posts},
+        ],
+    )
+    content = response.choices[0].message.content
+    if not isinstance(content, str) or content == "":
+        raise GenerationError("OpenAI returned an empty response")
+    return content
+
+
+def save_digest(root: Path, content: str, generated_at: datetime) -> Path:
+    """Persist a successful model response beneath the requested project root."""
+    if not content:
+        raise ValueError("Digest content is empty")
+    timestamp = generated_at.astimezone(timezone.utc).strftime("%Y-%m-%d_%H-%M-%SZ")
+    output_path = Path(root) / "output" / f"{timestamp}.md"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(content, encoding="utf-8")
+    return output_path
+
+
+def run(
+    days: int,
+    root: Path = PROJECT_ROOT,
+    environ: Mapping[str, str] = os.environ,
+    *,
+    telegram_client_factory: Callable[..., object] | None = None,
+    openai_client_factory: Callable[..., object] | None = None,
+    now_factory: Callable[[], datetime] | None = None,
+    printer: Callable[[str], None] = print,
+) -> Path:
+    """Collect one time window, generate a digest, and persist it on success."""
+    if isinstance(days, bool) or not isinstance(days, int) or days <= 0:
+        raise ConfigError("--days must be a positive integer")
+    root = Path(root)
+    settings = load_settings(root, environ)
+    prompt = load_prompt(root)
+    usernames = load_channel_usernames(root)
+    as_of = (now_factory or (lambda: datetime.now(timezone.utc)))().astimezone(timezone.utc)
+    posts = asyncio.run(
+        collect_posts(
+            root,
+            settings,
+            usernames,
+            as_of - timedelta(days=days),
+            as_of,
+            client_factory=telegram_client_factory,
+        )
+    )
+    if not posts:
+        raise CollectionError("No posts found in the requested time window")
+    formatted_posts = format_posts(posts)
+    content = generate_digest(
+        settings,
+        prompt,
+        formatted_posts,
+        client_factory=openai_client_factory,
+    )
+    output_path = save_digest(root, content, as_of)
+    printer(f"Channels: {len(usernames)}")
+    printer(f"Posts: {len(posts)}")
+    printer(f"Output: {output_path.resolve()}")
+    return output_path
+
+
+def _positive_days(value: str) -> int:
+    try:
+        days = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("--days must be a positive integer") from error
+    if days <= 0:
+        raise argparse.ArgumentTypeError("--days must be a positive integer")
+    return days
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Parse CLI arguments and report safe, concise operational errors."""
+    parser = argparse.ArgumentParser(description="Generate a local Telegram digest.")
+    parser.add_argument("--days", required=True, type=_positive_days, help="positive number of UTC days to collect")
+    args = parser.parse_args(argv)
+    try:
+        run(args.days)
+    except ConfigError as error:
+        print(f"Configuration error: {error}", file=sys.stderr)
+        return 1
+    except CollectionError:
+        print("Telegram error: unable to collect posts", file=sys.stderr)
+        return 1
+    except GenerationError:
+        print("OpenAI error: unable to generate digest", file=sys.stderr)
+        return 1
+    except Exception as error:
+        module = error.__class__.__module__
+        name = error.__class__.__name__
+        if name == "BadRequestError":
+            print("OpenAI request may exceed the context limit; reduce --days or sources.", file=sys.stderr)
+            return 1
+        if module.startswith("openai"):
+            print("OpenAI error: unable to generate digest", file=sys.stderr)
+            return 1
+        if module.startswith("telethon"):
+            print("Telegram error: unable to collect posts", file=sys.stderr)
+            return 1
+        raise
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

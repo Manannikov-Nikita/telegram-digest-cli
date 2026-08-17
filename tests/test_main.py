@@ -1,7 +1,13 @@
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from datetime import datetime, timedelta, timezone
+from io import StringIO
 from pathlib import Path
+import subprocess
+import sys
+
+import main as digest_main
 
 from main import (
     CollectionError,
@@ -349,6 +355,293 @@ class LocalInputTests(unittest.TestCase):
         with self.assertRaises(ConfigError):
             load_channel_usernames(self.root)
 
+
+class FakeCompletionResponse:
+    def __init__(self, content):
+        self.choices = [type("Choice", (), {"message": type("Message", (), {"content": content})()})()]
+
+
+class FakeOpenAIClient:
+    def __init__(self, response):
+        self.response = response
+        self.requests = []
+        self.chat = type("Chat", (), {"completions": self})()
+
+    def create(self, **kwargs):
+        self.requests.append(kwargs)
+        return self.response
+
+
+class DigestGenerationTests(unittest.TestCase):
+    def test_sends_one_exact_request_and_returns_verbatim_model_text(self):
+        settings = Settings(123, "tg-hash", "https://api.example.test/v1", "api-key", "digest-model")
+        client = FakeOpenAIClient(FakeCompletionResponse("# Digest\n\nExact model text."))
+        constructor_calls = []
+
+        def factory(**kwargs):
+            constructor_calls.append(kwargs)
+            return client
+
+        result = digest_main.generate_digest(
+            settings,
+            "You write concise digests.",
+            "Telegram posts collected:\n\n1. Source post",
+            client_factory=factory,
+        )
+
+        self.assertEqual(result, "# Digest\n\nExact model text.")
+        self.assertEqual(
+            constructor_calls,
+            [{"base_url": "https://api.example.test/v1", "api_key": "api-key", "max_retries": 0}],
+        )
+        self.assertEqual(
+            client.requests,
+            [
+                {
+                    "model": "digest-model",
+                    "messages": [
+                        {"role": "system", "content": "You write concise digests."},
+                        {"role": "user", "content": "Telegram posts collected:\n\n1. Source post"},
+                    ],
+                }
+            ],
+        )
+
+    def test_rejects_an_empty_model_response(self):
+        settings = Settings(123, "tg-hash", "https://api.example.test/v1", "api-key", "digest-model")
+        client = FakeOpenAIClient(FakeCompletionResponse(""))
+
+        with self.assertRaises(digest_main.GenerationError):
+            digest_main.generate_digest(settings, "System prompt", "One post", client_factory=lambda **_: client)
+
+    def test_rejects_a_non_string_model_response(self):
+        settings = Settings(123, "tg-hash", "https://api.example.test/v1", "api-key", "digest-model")
+        client = FakeOpenAIClient(FakeCompletionResponse(None))
+
+        with self.assertRaises(digest_main.GenerationError):
+            digest_main.generate_digest(settings, "System prompt", "One post", client_factory=lambda **_: client)
+
+
+class DigestPersistenceTests(unittest.TestCase):
+    def test_writes_verbatim_utf8_text_to_a_utc_named_output_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            saved_path = digest_main.save_digest(
+                root,
+                "# Сводка\n\nТочный текст модели.",
+                datetime(2026, 8, 17, 7, 8, 9, tzinfo=timezone(timedelta(hours=3))),
+            )
+
+            self.assertEqual(saved_path, root / "output" / "2026-08-17_04-08-09Z.md")
+            self.assertEqual(saved_path.read_text(encoding="utf-8"), "# Сводка\n\nТочный текст модели.")
+
+    def test_refuses_empty_content_without_creating_an_output_directory(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+
+            with self.assertRaises(ValueError):
+                digest_main.save_digest(root, "", datetime(2026, 8, 17, tzinfo=UTC))
+
+            self.assertFalse((root / "output").exists())
+
+
+class DigestRunTests(unittest.TestCase):
+    def test_runs_the_real_collection_flow_and_prints_only_summary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / ".env").write_text(VALID_ENV, encoding="utf-8")
+            (root / "PROMPT.md").write_text("Make a digest.", encoding="utf-8")
+            (root / "DIGEST.md").write_text("https://t.me/News\n", encoding="utf-8")
+            as_of = datetime(2026, 8, 17, 12, 0, tzinfo=UTC)
+            telegram_client = FakeTelegramClient(
+                {"News": FakeEntity(title="News", username="News")},
+                {"News": [FakeMessage(5, as_of, "Visible source post")]},
+            )
+            openai_client = FakeOpenAIClient(FakeCompletionResponse("# Saved digest"))
+            lines = []
+
+            output_path = digest_main.run(
+                2,
+                root=root,
+                environ={},
+                telegram_client_factory=lambda *args: telegram_client,
+                openai_client_factory=lambda **kwargs: openai_client,
+                now_factory=lambda: as_of,
+                printer=lines.append,
+            )
+
+            self.assertEqual(output_path, root / "output" / "2026-08-17_12-00-00Z.md")
+            self.assertEqual(output_path.read_text(encoding="utf-8"), "# Saved digest")
+            self.assertEqual(telegram_client.events, ["start", "resolve:News", "disconnect"])
+            self.assertEqual(len(openai_client.requests), 1)
+            self.assertEqual(lines, [f"Channels: 1", f"Posts: 1", f"Output: {output_path.resolve()}"])
+
+    def test_rejects_nonpositive_days_before_touching_telegram_or_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / ".env").write_text(VALID_ENV, encoding="utf-8")
+            (root / "PROMPT.md").write_text("Make a digest.", encoding="utf-8")
+            (root / "DIGEST.md").write_text("https://t.me/News\n", encoding="utf-8")
+            network_calls = []
+
+            def telegram_factory(*args):
+                network_calls.append(args)
+                raise AssertionError("Telegram must not start")
+
+            for days in (0, -1):
+                with self.subTest(days=days):
+                    with self.assertRaisesRegex(ConfigError, "positive"):
+                        digest_main.run(days, root=root, environ={}, telegram_client_factory=telegram_factory)
+            self.assertEqual(network_calls, [])
+            self.assertFalse((root / "output").exists())
+
+    def test_refuses_zero_collected_posts_without_calling_the_model_or_writing_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / ".env").write_text(VALID_ENV, encoding="utf-8")
+            (root / "PROMPT.md").write_text("Make a digest.", encoding="utf-8")
+            (root / "DIGEST.md").write_text("https://t.me/News\n", encoding="utf-8")
+            point = datetime(2026, 8, 17, 12, 0, tzinfo=UTC)
+            telegram_client = FakeTelegramClient(
+                {"News": FakeEntity(title="News", username="News")},
+                {"News": []},
+            )
+            openai_client = FakeOpenAIClient(FakeCompletionResponse("must not be used"))
+
+            with self.assertRaisesRegex(CollectionError, "No posts"):
+                digest_main.run(
+                    1,
+                    root=root,
+                    environ={},
+                    telegram_client_factory=lambda *args: telegram_client,
+                    openai_client_factory=lambda **kwargs: openai_client,
+                    now_factory=lambda: point,
+                )
+
+            self.assertEqual(openai_client.requests, [])
+            self.assertFalse((root / "output").exists())
+
+    def test_telegram_failure_creates_no_output_and_never_calls_the_model(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / ".env").write_text(VALID_ENV, encoding="utf-8")
+            (root / "PROMPT.md").write_text("Make a digest.", encoding="utf-8")
+            (root / "DIGEST.md").write_text("https://t.me/News\n", encoding="utf-8")
+            telegram_client = FakeTelegramClient({}, {}, error_by_username={"News": RuntimeError("unavailable")})
+            openai_client = FakeOpenAIClient(FakeCompletionResponse("must not be used"))
+            lines = []
+
+            with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                digest_main.run(
+                    1,
+                    root=root,
+                    environ={},
+                    telegram_client_factory=lambda *args: telegram_client,
+                    openai_client_factory=lambda **kwargs: openai_client,
+                    printer=lines.append,
+                )
+
+            self.assertEqual(openai_client.requests, [])
+            self.assertEqual(lines, [])
+            self.assertFalse((root / "output").exists())
+
+    def test_model_failure_creates_no_output_or_summary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / ".env").write_text(VALID_ENV, encoding="utf-8")
+            (root / "PROMPT.md").write_text("Make a digest.", encoding="utf-8")
+            (root / "DIGEST.md").write_text("https://t.me/News\n", encoding="utf-8")
+            point = datetime(2026, 8, 17, 12, 0, tzinfo=UTC)
+            telegram_client = FakeTelegramClient(
+                {"News": FakeEntity(title="News", username="News")},
+                {"News": [FakeMessage(5, point, "Visible source post")]},
+            )
+            openai_client = FakeOpenAIClient(FakeCompletionResponse("unused"))
+            openai_client.create = lambda **kwargs: (_ for _ in ()).throw(RuntimeError("model unavailable"))
+            lines = []
+
+            with self.assertRaisesRegex(RuntimeError, "model unavailable"):
+                digest_main.run(
+                    1,
+                    root=root,
+                    environ={},
+                    telegram_client_factory=lambda *args: telegram_client,
+                    openai_client_factory=lambda **kwargs: openai_client,
+                    now_factory=lambda: point,
+                    printer=lines.append,
+                )
+
+            self.assertEqual(lines, [])
+            self.assertFalse((root / "output").exists())
+
+    def test_empty_model_response_creates_no_output_or_summary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / ".env").write_text(VALID_ENV, encoding="utf-8")
+            (root / "PROMPT.md").write_text("Make a digest.", encoding="utf-8")
+            (root / "DIGEST.md").write_text("https://t.me/News\n", encoding="utf-8")
+            point = datetime(2026, 8, 17, 12, 0, tzinfo=UTC)
+            telegram_client = FakeTelegramClient(
+                {"News": FakeEntity(title="News", username="News")},
+                {"News": [FakeMessage(5, point, "Visible source post")]},
+            )
+            openai_client = FakeOpenAIClient(FakeCompletionResponse(""))
+            lines = []
+
+            with self.assertRaises(digest_main.GenerationError):
+                digest_main.run(
+                    1,
+                    root=root,
+                    environ={},
+                    telegram_client_factory=lambda *args: telegram_client,
+                    openai_client_factory=lambda **kwargs: openai_client,
+                    now_factory=lambda: point,
+                    printer=lines.append,
+                )
+
+            self.assertEqual(lines, [])
+            self.assertFalse((root / "output").exists())
+
+
+class CommandLineTests(unittest.TestCase):
+    def test_help_succeeds_and_missing_or_nonpositive_days_fail_without_stdout(self):
+        script = Path(digest_main.__file__).resolve()
+
+        help_result = subprocess.run(
+            [sys.executable, str(script), "--help"], text=True, capture_output=True, check=False
+        )
+        self.assertEqual(help_result.returncode, 0)
+        self.assertIn("usage:", help_result.stdout)
+        self.assertEqual(help_result.stderr, "")
+
+        for arguments in ([], ["--days", "0"], ["--days", "-1"]):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run(
+                    [sys.executable, str(script), *arguments], text=True, capture_output=True, check=False
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("--days", result.stderr)
+
+    def test_known_operational_errors_return_safe_nonzero_stderr(self):
+        cases = (
+            (ConfigError("Missing PROMPT.md"), "Configuration error: Missing PROMPT.md"),
+            (CollectionError("source details"), "Telegram error: unable to collect posts"),
+            (digest_main.GenerationError("model details"), "OpenAI error: unable to generate digest"),
+            (type("BadRequestError", (Exception,), {})("request details"), "reduce --days or sources"),
+        )
+        original_run = digest_main.run
+        try:
+            for error, expected_message in cases:
+                with self.subTest(error=type(error).__name__):
+                    digest_main.run = lambda days, error=error: (_ for _ in ()).throw(error)
+                    stderr = StringIO()
+                    with redirect_stderr(stderr):
+                        self.assertEqual(digest_main.main(["--days", "1"]), 1)
+                    self.assertIn(expected_message, stderr.getvalue())
+                    self.assertNotIn("details", stderr.getvalue())
+        finally:
+            digest_main.run = original_run
 
 if __name__ == "__main__":
     unittest.main()
