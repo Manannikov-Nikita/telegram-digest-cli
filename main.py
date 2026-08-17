@@ -344,6 +344,8 @@ def run(
     except GenerationError:
         raise
     except Exception as error:
+        if error.__class__.__name__ == "BadRequestError":
+            raise
         raise GenerationError("OpenAI request failed") from error
     output_path = save_digest(root, content, as_of)
     printer(f"Channels: {len(usernames)}")

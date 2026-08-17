@@ -720,5 +720,50 @@ class CommandLineTests(unittest.TestCase):
             self.assertEqual(stderr.getvalue(), "OpenAI error: unable to generate digest\n")
             self.assertFalse((root / "output").exists())
 
+    def test_bad_request_from_model_keeps_the_cli_context_limit_hint(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / ".env").write_text(VALID_ENV, encoding="utf-8")
+            (root / "PROMPT.md").write_text("Make a digest.", encoding="utf-8")
+            (root / "DIGEST.md").write_text("https://t.me/News\n", encoding="utf-8")
+            point = datetime(2026, 8, 17, 12, 0, tzinfo=UTC)
+            telegram_client = FakeTelegramClient(
+                {"News": FakeEntity(title="News", username="News")},
+                {"News": [FakeMessage(5, point, "Visible source post")]},
+            )
+            openai_client = FakeOpenAIClient(FakeCompletionResponse("unused"))
+            bad_request_error = type("BadRequestError", (Exception,), {})
+            openai_client.create = lambda **kwargs: (_ for _ in ()).throw(
+                bad_request_error("secret request detail")
+            )
+            original_run = digest_main.run
+
+            def run_with_bad_request(days):
+                return original_run(
+                    days,
+                    root=root,
+                    environ={},
+                    telegram_client_factory=lambda *args: telegram_client,
+                    openai_client_factory=lambda **kwargs: openai_client,
+                    now_factory=lambda: point,
+                )
+
+            digest_main.run = run_with_bad_request
+            stderr = StringIO()
+            stdout = StringIO()
+            try:
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    self.assertEqual(digest_main.main(["--days", "1"]), 1)
+            finally:
+                digest_main.run = original_run
+
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual(
+                stderr.getvalue(),
+                "OpenAI request may exceed the context limit; reduce --days or sources.\n",
+            )
+            self.assertNotIn("secret request detail", stderr.getvalue())
+            self.assertFalse((root / "output").exists())
+
 if __name__ == "__main__":
     unittest.main()
