@@ -1,6 +1,6 @@
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
@@ -421,6 +421,14 @@ class DigestGenerationTests(unittest.TestCase):
         with self.assertRaises(digest_main.GenerationError):
             digest_main.generate_digest(settings, "System prompt", "One post", client_factory=lambda **_: client)
 
+    def test_rejects_a_completion_without_choices(self):
+        settings = Settings(123, "tg-hash", "https://api.example.test/v1", "api-key", "digest-model")
+        response = type("EmptyChoicesResponse", (), {"choices": []})()
+        client = FakeOpenAIClient(response)
+
+        with self.assertRaises(digest_main.GenerationError):
+            digest_main.generate_digest(settings, "System prompt", "One post", client_factory=lambda **_: client)
+
 
 class DigestPersistenceTests(unittest.TestCase):
     def test_writes_verbatim_utf8_text_to_a_utc_named_output_file(self):
@@ -531,7 +539,7 @@ class DigestRunTests(unittest.TestCase):
             openai_client = FakeOpenAIClient(FakeCompletionResponse("must not be used"))
             lines = []
 
-            with self.assertRaisesRegex(RuntimeError, "unavailable"):
+            with self.assertRaisesRegex(CollectionError, "Unable to collect posts"):
                 digest_main.run(
                     1,
                     root=root,
@@ -560,7 +568,7 @@ class DigestRunTests(unittest.TestCase):
             openai_client.create = lambda **kwargs: (_ for _ in ()).throw(RuntimeError("model unavailable"))
             lines = []
 
-            with self.assertRaisesRegex(RuntimeError, "model unavailable"):
+            with self.assertRaises(digest_main.GenerationError):
                 digest_main.run(
                     1,
                     root=root,
@@ -642,6 +650,75 @@ class CommandLineTests(unittest.TestCase):
                     self.assertNotIn("details", stderr.getvalue())
         finally:
             digest_main.run = original_run
+
+    def test_connection_error_from_collection_is_safe_in_cli_and_creates_no_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / ".env").write_text(VALID_ENV, encoding="utf-8")
+            (root / "PROMPT.md").write_text("Make a digest.", encoding="utf-8")
+            (root / "DIGEST.md").write_text("https://t.me/News\n", encoding="utf-8")
+            original_run = digest_main.run
+
+            def run_with_transport_failure(days):
+                return original_run(
+                    days,
+                    root=root,
+                    environ={},
+                    telegram_client_factory=lambda *args: (_ for _ in ()).throw(
+                        ConnectionError("secret transport detail")
+                    ),
+                )
+
+            digest_main.run = run_with_transport_failure
+            stderr = StringIO()
+            stdout = StringIO()
+            try:
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    self.assertEqual(digest_main.main(["--days", "1"]), 1)
+            finally:
+                digest_main.run = original_run
+
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual(stderr.getvalue(), "Telegram error: unable to collect posts\n")
+            self.assertNotIn("secret transport detail", stderr.getvalue())
+            self.assertFalse((root / "output").exists())
+
+    def test_empty_choices_are_safe_in_cli_and_create_no_output(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / ".env").write_text(VALID_ENV, encoding="utf-8")
+            (root / "PROMPT.md").write_text("Make a digest.", encoding="utf-8")
+            (root / "DIGEST.md").write_text("https://t.me/News\n", encoding="utf-8")
+            point = datetime(2026, 8, 17, 12, 0, tzinfo=UTC)
+            telegram_client = FakeTelegramClient(
+                {"News": FakeEntity(title="News", username="News")},
+                {"News": [FakeMessage(5, point, "Visible source post")]},
+            )
+            openai_client = FakeOpenAIClient(type("EmptyChoicesResponse", (), {"choices": []})())
+            original_run = digest_main.run
+
+            def run_with_empty_choices(days):
+                return original_run(
+                    days,
+                    root=root,
+                    environ={},
+                    telegram_client_factory=lambda *args: telegram_client,
+                    openai_client_factory=lambda **kwargs: openai_client,
+                    now_factory=lambda: point,
+                )
+
+            digest_main.run = run_with_empty_choices
+            stderr = StringIO()
+            stdout = StringIO()
+            try:
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    self.assertEqual(digest_main.main(["--days", "1"]), 1)
+            finally:
+                digest_main.run = original_run
+
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual(stderr.getvalue(), "OpenAI error: unable to generate digest\n")
+            self.assertFalse((root / "output").exists())
 
 if __name__ == "__main__":
     unittest.main()

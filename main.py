@@ -278,7 +278,10 @@ def generate_digest(
             {"role": "user", "content": formatted_posts},
         ],
     )
-    content = response.choices[0].message.content
+    try:
+        content = response.choices[0].message.content
+    except (AttributeError, IndexError, TypeError) as error:
+        raise GenerationError("OpenAI returned an invalid response") from error
     if not isinstance(content, str) or content == "":
         raise GenerationError("OpenAI returned an empty response")
     return content
@@ -313,25 +316,35 @@ def run(
     prompt = load_prompt(root)
     usernames = load_channel_usernames(root)
     as_of = (now_factory or (lambda: datetime.now(timezone.utc)))().astimezone(timezone.utc)
-    posts = asyncio.run(
-        collect_posts(
-            root,
-            settings,
-            usernames,
-            as_of - timedelta(days=days),
-            as_of,
-            client_factory=telegram_client_factory,
+    try:
+        posts = asyncio.run(
+            collect_posts(
+                root,
+                settings,
+                usernames,
+                as_of - timedelta(days=days),
+                as_of,
+                client_factory=telegram_client_factory,
+            )
         )
-    )
+    except CollectionError:
+        raise
+    except Exception as error:
+        raise CollectionError("Unable to collect posts") from error
     if not posts:
         raise CollectionError("No posts found in the requested time window")
     formatted_posts = format_posts(posts)
-    content = generate_digest(
-        settings,
-        prompt,
-        formatted_posts,
-        client_factory=openai_client_factory,
-    )
+    try:
+        content = generate_digest(
+            settings,
+            prompt,
+            formatted_posts,
+            client_factory=openai_client_factory,
+        )
+    except GenerationError:
+        raise
+    except Exception as error:
+        raise GenerationError("OpenAI request failed") from error
     output_path = save_digest(root, content, as_of)
     printer(f"Channels: {len(usernames)}")
     printer(f"Posts: {len(posts)}")
