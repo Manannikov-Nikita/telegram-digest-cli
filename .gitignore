@@ -1,0 +1,6 @@
+.env
+.venv/
+telegram.session*
+output/
+__pycache__/
+*.py[cod]
