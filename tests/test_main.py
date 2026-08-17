@@ -297,6 +297,15 @@ class SettingsTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "OPENAI_BASE_URL"):
             load_settings(self.root, {})
 
+    def test_rejects_a_malformed_base_url_as_a_config_error(self):
+        (self.root / ".env").write_text(
+            VALID_ENV.replace("https://api.example.test/v1/", "https://[::1/v1"),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ConfigError, "OPENAI_BASE_URL"):
+            load_settings(self.root, {})
+
     def test_rejects_missing_required_value(self):
         (self.root / ".env").write_text(VALID_ENV.replace("OPENAI_MODEL=gpt-test\n", ""), encoding="utf-8")
 
@@ -326,6 +335,10 @@ class ChannelParsingTests(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(ConfigError):
                     parse_channel_urls(value)
+
+    def test_rejects_a_malformed_url_with_its_line_number(self):
+        with self.assertRaisesRegex(ConfigError, r"line 2"):
+            parse_channel_urls("https://t.me/News\nhttps://[::1\n")
 
 
 class LocalInputTests(unittest.TestCase):
@@ -375,7 +388,7 @@ class FakeOpenAIClient:
 class DigestGenerationTests(unittest.TestCase):
     def test_sends_one_exact_request_and_returns_verbatim_model_text(self):
         settings = Settings(123, "tg-hash", "https://api.example.test/v1", "api-key", "digest-model")
-        client = FakeOpenAIClient(FakeCompletionResponse("# Digest\n\nExact model text."))
+        client = FakeOpenAIClient(FakeCompletionResponse("\n# Digest\n\nExact model text.\n"))
         constructor_calls = []
 
         def factory(**kwargs):
@@ -389,7 +402,7 @@ class DigestGenerationTests(unittest.TestCase):
             client_factory=factory,
         )
 
-        self.assertEqual(result, "# Digest\n\nExact model text.")
+        self.assertEqual(result, "\n# Digest\n\nExact model text.\n")
         self.assertEqual(
             constructor_calls,
             [{"base_url": "https://api.example.test/v1", "api_key": "api-key", "max_retries": 0}],
@@ -410,6 +423,13 @@ class DigestGenerationTests(unittest.TestCase):
     def test_rejects_an_empty_model_response(self):
         settings = Settings(123, "tg-hash", "https://api.example.test/v1", "api-key", "digest-model")
         client = FakeOpenAIClient(FakeCompletionResponse(""))
+
+        with self.assertRaises(digest_main.GenerationError):
+            digest_main.generate_digest(settings, "System prompt", "One post", client_factory=lambda **_: client)
+
+    def test_rejects_a_whitespace_only_model_response(self):
+        settings = Settings(123, "tg-hash", "https://api.example.test/v1", "api-key", "digest-model")
+        client = FakeOpenAIClient(FakeCompletionResponse(" \n\t"))
 
         with self.assertRaises(digest_main.GenerationError):
             digest_main.generate_digest(settings, "System prompt", "One post", client_factory=lambda **_: client)
@@ -610,6 +630,34 @@ class DigestRunTests(unittest.TestCase):
             self.assertEqual(lines, [])
             self.assertFalse((root / "output").exists())
 
+    def test_whitespace_model_response_creates_no_output_or_summary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / ".env").write_text(VALID_ENV, encoding="utf-8")
+            (root / "PROMPT.md").write_text("Make a digest.", encoding="utf-8")
+            (root / "DIGEST.md").write_text("https://t.me/News\n", encoding="utf-8")
+            point = datetime(2026, 8, 17, 12, 0, tzinfo=UTC)
+            telegram_client = FakeTelegramClient(
+                {"News": FakeEntity(title="News", username="News")},
+                {"News": [FakeMessage(5, point, "Visible source post")]},
+            )
+            openai_client = FakeOpenAIClient(FakeCompletionResponse(" \n\t"))
+            lines = []
+
+            with self.assertRaises(digest_main.GenerationError):
+                digest_main.run(
+                    1,
+                    root=root,
+                    environ={},
+                    telegram_client_factory=lambda *args: telegram_client,
+                    openai_client_factory=lambda **kwargs: openai_client,
+                    now_factory=lambda: point,
+                    printer=lines.append,
+                )
+
+            self.assertEqual(lines, [])
+            self.assertFalse((root / "output").exists())
+
 
 class CommandLineTests(unittest.TestCase):
     def test_help_succeeds_and_missing_or_nonpositive_days_fail_without_stdout(self):
@@ -681,6 +729,31 @@ class CommandLineTests(unittest.TestCase):
             self.assertEqual(stdout.getvalue(), "")
             self.assertEqual(stderr.getvalue(), "Telegram error: unable to collect posts\n")
             self.assertNotIn("secret transport detail", stderr.getvalue())
+            self.assertFalse((root / "output").exists())
+
+    def test_malformed_channel_url_is_safe_at_the_real_cli_and_run_boundary(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / ".env").write_text(VALID_ENV, encoding="utf-8")
+            (root / "PROMPT.md").write_text("Make a digest.", encoding="utf-8")
+            (root / "DIGEST.md").write_text("https://[::1\n", encoding="utf-8")
+            original_run = digest_main.run
+
+            def run_with_local_validation(days):
+                return original_run(days, root=root, environ={})
+
+            digest_main.run = run_with_local_validation
+            stderr = StringIO()
+            stdout = StringIO()
+            try:
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    self.assertEqual(digest_main.main(["--days", "1"]), 1)
+            finally:
+                digest_main.run = original_run
+
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual(stderr.getvalue(), "Configuration error: Invalid channel URL on line 1\n")
+            self.assertNotIn("Traceback", stderr.getvalue())
             self.assertFalse((root / "output").exists())
 
     def test_empty_choices_are_safe_in_cli_and_create_no_output(self):

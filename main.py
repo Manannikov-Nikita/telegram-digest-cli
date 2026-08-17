@@ -112,8 +112,11 @@ def load_settings(root: Path, environ: Mapping[str, str]) -> Settings:
         raise ConfigError("TG_API_ID must be an integer") from error
 
     base_url = values["OPENAI_BASE_URL"]
-    parsed = urlparse(base_url)
-    path = parsed.path.rstrip("/")
+    try:
+        parsed = urlparse(base_url)
+        path = parsed.path.rstrip("/")
+    except ValueError as error:
+        raise ConfigError("OPENAI_BASE_URL must be an HTTP(S) URL ending in /v1") from error
     if parsed.scheme not in {"http", "https"} or not parsed.netloc or not path.endswith("/v1"):
         raise ConfigError("OPENAI_BASE_URL must be an HTTP(S) URL ending in /v1")
 
@@ -133,12 +136,16 @@ def parse_channel_urls(text: str) -> list[str]:
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
-        parsed = urlparse(line)
+        try:
+            parsed = urlparse(line)
+            hostname = parsed.hostname
+        except ValueError as error:
+            raise ConfigError(f"Invalid channel URL on line {number}") from error
         path_match = re.fullmatch(r"/([A-Za-z0-9_]+)/?", parsed.path)
         username = path_match.group(1) if path_match else ""
         valid = (
             parsed.scheme == "https"
-            and parsed.hostname == "t.me"
+            and hostname == "t.me"
             and parsed.netloc.lower() == "t.me"
             and "?" not in line
             and "#" not in line
@@ -282,7 +289,7 @@ def generate_digest(
         content = response.choices[0].message.content
     except (AttributeError, IndexError, TypeError) as error:
         raise GenerationError("OpenAI returned an invalid response") from error
-    if not isinstance(content, str) or content == "":
+    if not isinstance(content, str) or not content.strip():
         raise GenerationError("OpenAI returned an empty response")
     return content
 
