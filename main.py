@@ -1,14 +1,19 @@
 """Local configuration and source parsing for Telegram Digest."""
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping
+from typing import Callable, Mapping
 from urllib.parse import urlparse
 import re
 
 
 class ConfigError(ValueError):
     """Raised when local Digest configuration is invalid."""
+
+
+class CollectionError(ValueError):
+    """Raised when a requested Telegram source is not a public broadcast channel."""
 
 
 @dataclass(frozen=True)
@@ -18,6 +23,15 @@ class Settings:
     openai_base_url: str
     openai_api_key: str
     openai_model: str
+
+
+@dataclass(frozen=True)
+class Post:
+    channel_title: str
+    channel_username: str
+    published_at: datetime
+    url: str
+    text: str
 
 
 REQUIRED_SETTINGS = (
@@ -131,3 +145,90 @@ def load_channel_usernames(root: Path) -> list[str]:
     if not usernames:
         raise ConfigError("DIGEST.md has no channel URLs")
     return usernames
+
+
+def _telegram_client_factory() -> Callable[..., object]:
+    from telethon import TelegramClient
+
+    return TelegramClient
+
+
+def _public_broadcast_details(entity: object) -> tuple[str, str]:
+    title = getattr(entity, "title", None)
+    username = getattr(entity, "username", None)
+    if (
+        not getattr(entity, "broadcast", False)
+        or getattr(entity, "megagroup", False)
+        or not isinstance(title, str)
+        or not title.strip()
+        or not isinstance(username, str)
+        or not username.strip()
+    ):
+        raise CollectionError("Source is not a public broadcast channel")
+    return title, username
+
+
+async def collect_posts(
+    root: Path,
+    settings: Settings,
+    usernames: list[str],
+    cutoff: datetime,
+    as_of: datetime,
+    *,
+    client_factory: Callable[..., object] | None = None,
+) -> list[Post]:
+    """Collect textual public-channel messages in the inclusive UTC time window."""
+    factory = client_factory or _telegram_client_factory()
+    client = factory(str(Path(root) / "telegram"), settings.tg_api_id, settings.tg_api_hash)
+    posts: list[Post] = []
+    try:
+        await client.start()
+        for requested_username in usernames:
+            entity = await client.get_entity(requested_username)
+            title, resolved_username = _public_broadcast_details(entity)
+            async for message in client.iter_messages(entity):
+                published_at = message.date.astimezone(timezone.utc)
+                if published_at > as_of:
+                    continue
+                if published_at < cutoff:
+                    break
+                text = message.raw_text.strip()
+                if not text:
+                    continue
+                posts.append(
+                    Post(
+                        title,
+                        resolved_username,
+                        published_at,
+                        f"https://t.me/{resolved_username}/{message.id}",
+                        text,
+                    )
+                )
+    finally:
+        await client.disconnect()
+    return sorted(
+        posts,
+        key=lambda post: (
+            post.published_at,
+            post.channel_username.casefold(),
+            post.url,
+            post.text,
+            post.channel_title,
+        ),
+    )
+
+
+def format_posts(posts: list[Post]) -> str:
+    """Render collected source posts as deterministic, user-facing plain text."""
+    if not posts:
+        raise ValueError("Cannot format an empty post list")
+    blocks = []
+    for number, post in enumerate(posts, start=1):
+        timestamp = post.published_at.astimezone(timezone.utc).isoformat()
+        blocks.append(
+            f"{number}. Channel: {post.channel_title} (@{post.channel_username})\n"
+            f"Published: {timestamp}\n"
+            f"URL: {post.url}\n"
+            f"Text:\n{post.text}"
+        )
+    return "Telegram posts collected:\n\n" + "\n\n".join(blocks)
