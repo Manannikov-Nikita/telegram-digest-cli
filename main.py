@@ -103,8 +103,11 @@ def parse_channel_urls(text: str) -> list[str]:
             parsed.scheme == "https"
             and parsed.hostname == "t.me"
             and parsed.netloc.lower() == "t.me"
+            and "?" not in line
+            and "#" not in line
             and not parsed.query
             and not parsed.fragment
+            and not parsed.params
             and bool(USERNAME_RE.fullmatch(username))
         )
         if not valid:
