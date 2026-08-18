@@ -143,6 +143,38 @@ class TelegramCollectionTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_skips_service_messages_without_raw_text_and_keeps_collecting(self):
+        settings = Settings(123, "hash", "https://api.example.test/v1", "key", "model")
+        point = datetime(2026, 8, 10, 12, tzinfo=UTC)
+        entity = FakeEntity(title="News", username="news")
+        client = FakeTelegramClient(
+            {"news": entity},
+            {
+                "news": [
+                    FakeMessage(2, point, None),
+                    FakeMessage(1, point, "  media caption  "),
+                ]
+            },
+        )
+
+        try:
+            posts = await collect_posts(
+                Path("/tmp/digest-root"),
+                settings,
+                ["news"],
+                point,
+                point,
+                client_factory=lambda *args: client,
+            )
+        except AttributeError as error:
+            self.fail(f"service messages must be skipped: {error}")
+
+        self.assertEqual(
+            posts,
+            [Post("News", "news", point, "https://t.me/news/1", "media caption")],
+        )
+        self.assertEqual(client.events, ["start", "resolve:news", "disconnect"])
+
     async def test_rejects_non_public_broadcast_entities_and_disconnects(self):
         settings = Settings(123, "hash", "https://api.example.test/v1", "key", "model")
         point = datetime(2026, 8, 10, 12, tzinfo=UTC)

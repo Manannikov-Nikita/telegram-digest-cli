@@ -227,7 +227,10 @@ async def collect_posts(
                     continue
                 if published_at < cutoff:
                     break
-                text = message.raw_text.strip()
+                raw_text = message.raw_text
+                if not isinstance(raw_text, str):
+                    continue
+                text = raw_text.strip()
                 if not text:
                     continue
                 posts.append(
