@@ -136,26 +136,30 @@ def parse_channel_urls(text: str) -> list[str]:
         line = raw_line.strip()
         if not line or line.startswith("#"):
             continue
-        try:
-            parsed = urlparse(line)
-            hostname = parsed.hostname
-        except ValueError as error:
-            raise ConfigError(f"Invalid channel URL on line {number}") from error
-        path_match = re.fullmatch(r"/([A-Za-z0-9_]+)/?", parsed.path)
-        username = path_match.group(1) if path_match else ""
-        valid = (
-            parsed.scheme == "https"
-            and hostname == "t.me"
-            and parsed.netloc.lower() == "t.me"
-            and "?" not in line
-            and "#" not in line
-            and not parsed.query
-            and not parsed.fragment
-            and not parsed.params
-            and bool(USERNAME_RE.fullmatch(username))
-        )
+        if line.startswith("@"):
+            username = line[1:]
+            valid = bool(USERNAME_RE.fullmatch(username))
+        else:
+            try:
+                parsed = urlparse(line)
+                hostname = parsed.hostname
+            except ValueError as error:
+                raise ConfigError(f"Invalid channel source on line {number}") from error
+            path_match = re.fullmatch(r"/([A-Za-z0-9_]+)/?", parsed.path)
+            username = path_match.group(1) if path_match else ""
+            valid = (
+                parsed.scheme == "https"
+                and hostname == "t.me"
+                and parsed.netloc.lower() == "t.me"
+                and "?" not in line
+                and "#" not in line
+                and not parsed.query
+                and not parsed.fragment
+                and not parsed.params
+                and bool(USERNAME_RE.fullmatch(username))
+            )
         if not valid:
-            raise ConfigError(f"Invalid channel URL on line {number}")
+            raise ConfigError(f"Invalid channel source on line {number}")
         normalized = username.lower()
         if normalized not in seen:
             seen.add(normalized)
@@ -173,7 +177,7 @@ def load_prompt(root: Path) -> str:
 def load_channel_usernames(root: Path) -> list[str]:
     usernames = parse_channel_urls(_read_text(root, "DIGEST.md"))
     if not usernames:
-        raise ConfigError("DIGEST.md has no channel URLs")
+        raise ConfigError("DIGEST.md has no channel sources")
     return usernames
 
 

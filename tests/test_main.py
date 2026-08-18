@@ -319,6 +319,19 @@ class ChannelParsingTests(unittest.TestCase):
 
         self.assertEqual(usernames, ["News", "Second"])
 
+    def test_accepts_at_handles_and_deduplicates_across_source_forms(self):
+        usernames = parse_channel_urls(
+            "# sources\n@News\nhttps://t.me/news\nhttps://t.me/Second\n@SECOND\n"
+        )
+
+        self.assertEqual(usernames, ["News", "Second"])
+
+    def test_rejects_malformed_at_handles_with_their_line_number(self):
+        for value in ("@", "@@news", "@news extra", "@news/42", "news"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ConfigError, r"Invalid channel source on line 2"):
+                    parse_channel_urls(f"@Valid\n{value}\n")
+
     def test_rejects_non_root_or_non_telegram_urls_and_prose(self):
         for value in (
             "https://t.me/+invite",
@@ -337,7 +350,7 @@ class ChannelParsingTests(unittest.TestCase):
                     parse_channel_urls(value)
 
     def test_rejects_a_malformed_url_with_its_line_number(self):
-        with self.assertRaisesRegex(ConfigError, r"line 2"):
+        with self.assertRaisesRegex(ConfigError, r"Invalid channel source on line 2"):
             parse_channel_urls("https://t.me/News\nhttps://[::1\n")
 
 
@@ -351,7 +364,7 @@ class LocalInputTests(unittest.TestCase):
 
     def test_loads_stripped_prompt_and_channels_from_given_root(self):
         (self.root / "PROMPT.md").write_text("\n Сделай краткую сводку. \n", encoding="utf-8")
-        (self.root / "DIGEST.md").write_text("# channels\nhttps://t.me/News\n", encoding="utf-8")
+        (self.root / "DIGEST.md").write_text("# channels\n@News\n", encoding="utf-8")
 
         self.assertEqual(load_prompt(self.root), "Сделай краткую сводку.")
         self.assertEqual(load_channel_usernames(self.root), ["News"])
@@ -752,7 +765,7 @@ class CommandLineTests(unittest.TestCase):
                 digest_main.run = original_run
 
             self.assertEqual(stdout.getvalue(), "")
-            self.assertEqual(stderr.getvalue(), "Configuration error: Invalid channel URL on line 1\n")
+            self.assertEqual(stderr.getvalue(), "Configuration error: Invalid channel source on line 1\n")
             self.assertNotIn("Traceback", stderr.getvalue())
             self.assertFalse((root / "output").exists())
 
