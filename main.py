@@ -9,7 +9,9 @@ import argparse
 import asyncio
 import os
 import re
+import shlex
 import sys
+import traceback
 
 try:
     from openai import OpenAI
@@ -397,35 +399,98 @@ def _positive_days(value: str) -> int:
     return days
 
 
+def _missing_python_package(error: BaseException) -> str | None:
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, ModuleNotFoundError):
+            name = current.name
+            if isinstance(name, str) and name:
+                return name.split(".", 1)[0]
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _print_cli_error(
+    message: str,
+    error: Exception,
+    *,
+    debug: bool,
+    show_debug_hint: bool = False,
+) -> None:
+    missing_package = _missing_python_package(error)
+    if missing_package is not None:
+        install_command = shlex.join(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "-r",
+                str(PROJECT_ROOT / "requirements.txt"),
+            ]
+        )
+        message = (
+            f"Dependency error: Python package '{missing_package}' is not installed.\n"
+            f"Install dependencies: {install_command}"
+        )
+    elif show_debug_hint and not debug:
+        message = f"{message}\nRe-run with --debug for the full Python traceback."
+    print(message, file=sys.stderr)
+    if debug:
+        traceback.print_exception(error, file=sys.stderr)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Parse CLI arguments and report safe, concise operational errors."""
     parser = argparse.ArgumentParser(description="Generate a local Telegram digest.")
     parser.add_argument("--days", required=True, type=_positive_days, help="positive number of UTC days to collect")
+    parser.add_argument("--debug", action="store_true", help="show the full Python traceback on errors")
     args = parser.parse_args(argv)
     try:
         run(args.days)
     except ConfigError as error:
-        print(f"Configuration error: {error}", file=sys.stderr)
+        _print_cli_error(
+            f"Configuration error: {error}",
+            error,
+            debug=args.debug,
+        )
         return 1
-    except CollectionError:
-        print("Telegram error: unable to collect posts", file=sys.stderr)
+    except CollectionError as error:
+        _print_cli_error(
+            "Telegram error: unable to collect posts",
+            error,
+            debug=args.debug,
+            show_debug_hint=True,
+        )
         return 1
-    except GenerationError:
-        print("OpenAI error: unable to generate digest", file=sys.stderr)
+    except GenerationError as error:
+        _print_cli_error(
+            "OpenAI error: unable to generate digest",
+            error,
+            debug=args.debug,
+            show_debug_hint=True,
+        )
         return 1
     except Exception as error:
         module = error.__class__.__module__
         name = error.__class__.__name__
         if name == "BadRequestError":
-            print("OpenAI request may exceed the context limit; reduce --days or sources.", file=sys.stderr)
-            return 1
-        if module.startswith("openai"):
-            print("OpenAI error: unable to generate digest", file=sys.stderr)
-            return 1
-        if module.startswith("telethon"):
-            print("Telegram error: unable to collect posts", file=sys.stderr)
-            return 1
-        raise
+            message = "OpenAI request may exceed the context limit; reduce --days or sources."
+        elif module.startswith("openai"):
+            message = "OpenAI error: unable to generate digest"
+        elif module.startswith("telethon"):
+            message = "Telegram error: unable to collect posts"
+        else:
+            raise
+        _print_cli_error(
+            message,
+            error,
+            debug=args.debug,
+            show_debug_hint=True,
+        )
+        return 1
     return 0
 
 

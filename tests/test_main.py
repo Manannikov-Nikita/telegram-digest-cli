@@ -801,6 +801,7 @@ class CommandLineTests(unittest.TestCase):
         )
         self.assertEqual(help_result.returncode, 0)
         self.assertIn("usage:", help_result.stdout)
+        self.assertIn("--debug", help_result.stdout)
         self.assertEqual(help_result.stderr, "")
 
         for arguments in ([], ["--days", "0"], ["--days", "-1"]):
@@ -814,10 +815,68 @@ class CommandLineTests(unittest.TestCase):
 
     def test_known_operational_errors_return_safe_nonzero_stderr(self):
         cases = (
-            (ConfigError("Missing PROMPT.md"), "Configuration error: Missing PROMPT.md"),
-            (CollectionError("source details"), "Telegram error: unable to collect posts"),
-            (digest_main.GenerationError("model details"), "OpenAI error: unable to generate digest"),
-            (type("BadRequestError", (Exception,), {})("request details"), "reduce --days or sources"),
+            (ConfigError("Missing PROMPT.md"), "Configuration error: Missing PROMPT.md", False),
+            (CollectionError("source details"), "Telegram error: unable to collect posts", True),
+            (
+                digest_main.GenerationError("model details"),
+                "OpenAI error: unable to generate digest",
+                True,
+            ),
+            (
+                type("BadRequestError", (Exception,), {})("request details"),
+                "reduce --days or sources",
+                True,
+            ),
+        )
+        original_run = digest_main.run
+        try:
+            for error, expected_message, expects_debug_hint in cases:
+                with self.subTest(error=type(error).__name__):
+                    digest_main.run = lambda days, error=error: (_ for _ in ()).throw(error)
+                    stderr = StringIO()
+                    with redirect_stderr(stderr):
+                        self.assertEqual(digest_main.main(["--days", "1"]), 1)
+                    details = stderr.getvalue()
+                    self.assertIn(expected_message, details)
+                    self.assertEqual("Re-run with --debug" in details, expects_debug_hint)
+                    self.assertNotIn("details", details)
+                    self.assertNotIn("Traceback", details)
+        finally:
+            digest_main.run = original_run
+
+    def test_debug_prints_full_chained_traceback_for_collection_errors(self):
+        original_run = digest_main.run
+
+        def run_with_transport_failure(days):
+            try:
+                raise ConnectionError("transport debug detail")
+            except ConnectionError as error:
+                raise CollectionError("Unable to collect posts") from error
+
+        digest_main.run = run_with_transport_failure
+        stderr = StringIO()
+        stdout = StringIO()
+        try:
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                self.assertEqual(digest_main.main(["--days", "1", "--debug"]), 1)
+        finally:
+            digest_main.run = original_run
+
+        details = stderr.getvalue()
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("Telegram error: unable to collect posts", details)
+        self.assertIn("Traceback (most recent call last):", details)
+        self.assertIn("ConnectionError: transport debug detail", details)
+        self.assertIn("CollectionError: Unable to collect posts", details)
+
+    def test_debug_prints_traceback_for_other_known_operational_errors(self):
+        cases = (
+            (ConfigError("configuration debug detail"), "Configuration error"),
+            (digest_main.GenerationError("generation debug detail"), "OpenAI error"),
+            (
+                type("BadRequestError", (Exception,), {})("request debug detail"),
+                "reduce --days or sources",
+            ),
         )
         original_run = digest_main.run
         try:
@@ -826,9 +885,53 @@ class CommandLineTests(unittest.TestCase):
                     digest_main.run = lambda days, error=error: (_ for _ in ()).throw(error)
                     stderr = StringIO()
                     with redirect_stderr(stderr):
+                        self.assertEqual(
+                            digest_main.main(["--days", "1", "--debug"]),
+                            1,
+                        )
+
+                    details = stderr.getvalue()
+                    self.assertIn(expected_message, details)
+                    self.assertIn("Traceback (most recent call last):", details)
+                    self.assertIn(str(error), details)
+        finally:
+            digest_main.run = original_run
+
+    def test_missing_dependency_reports_package_and_install_command(self):
+        cases = (
+            (CollectionError, "telethon", "Telegram error"),
+            (digest_main.GenerationError, "openai", "OpenAI error"),
+        )
+        original_run = digest_main.run
+        try:
+            for outer_error, package, generic_message in cases:
+                with self.subTest(package=package):
+                    def run_with_missing_dependency(days):
+                        try:
+                            raise ModuleNotFoundError(
+                                f"No module named '{package}'",
+                                name=package,
+                            )
+                        except ModuleNotFoundError as error:
+                            raise outer_error("wrapped dependency detail") from error
+
+                    digest_main.run = run_with_missing_dependency
+                    stderr = StringIO()
+                    stdout = StringIO()
+                    with redirect_stdout(stdout), redirect_stderr(stderr):
                         self.assertEqual(digest_main.main(["--days", "1"]), 1)
-                    self.assertIn(expected_message, stderr.getvalue())
-                    self.assertNotIn("details", stderr.getvalue())
+
+                    details = stderr.getvalue()
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertIn(
+                        f"Dependency error: Python package '{package}' is not installed.",
+                        details,
+                    )
+                    self.assertIn(sys.executable, details)
+                    self.assertIn(str(Path(digest_main.__file__).resolve().parent / "requirements.txt"), details)
+                    self.assertNotIn(generic_message, details)
+                    self.assertNotIn("wrapped dependency detail", details)
+                    self.assertNotIn("Traceback", details)
         finally:
             digest_main.run = original_run
 
@@ -860,7 +963,11 @@ class CommandLineTests(unittest.TestCase):
                 digest_main.run = original_run
 
             self.assertEqual(stdout.getvalue(), "")
-            self.assertEqual(stderr.getvalue(), "Telegram error: unable to collect posts\n")
+            self.assertEqual(
+                stderr.getvalue(),
+                "Telegram error: unable to collect posts\n"
+                "Re-run with --debug for the full Python traceback.\n",
+            )
             self.assertNotIn("secret transport detail", stderr.getvalue())
             self.assertFalse((root / "output").exists())
 
@@ -923,7 +1030,11 @@ class CommandLineTests(unittest.TestCase):
                 digest_main.run = original_run
 
             self.assertEqual(stdout.getvalue(), "")
-            self.assertEqual(stderr.getvalue(), "OpenAI error: unable to generate digest\n")
+            self.assertEqual(
+                stderr.getvalue(),
+                "OpenAI error: unable to generate digest\n"
+                "Re-run with --debug for the full Python traceback.\n",
+            )
             self.assertFalse((root / "output").exists())
 
     def test_bad_request_from_model_keeps_the_cli_context_limit_hint(self):
@@ -966,7 +1077,8 @@ class CommandLineTests(unittest.TestCase):
             self.assertEqual(stdout.getvalue(), "")
             self.assertEqual(
                 stderr.getvalue(),
-                "OpenAI request may exceed the context limit; reduce --days or sources.\n",
+                "OpenAI request may exceed the context limit; reduce --days or sources.\n"
+                "Re-run with --debug for the full Python traceback.\n",
             )
             self.assertNotIn("secret request detail", stderr.getvalue())
             self.assertFalse((root / "output").exists())
