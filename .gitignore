@@ -1,5 +1,6 @@
 .env
 .venv/
+.worktrees/
 telegram.session*
 output/
 __pycache__/
