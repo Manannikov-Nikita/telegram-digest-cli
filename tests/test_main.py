@@ -36,11 +36,26 @@ UTC = timezone.utc
 
 
 class FakeEntity:
-    def __init__(self, *, title, username, broadcast=True, megagroup=False):
+    def __init__(
+        self,
+        *,
+        title,
+        username,
+        broadcast=True,
+        megagroup=False,
+        usernames=None,
+    ):
         self.title = title
         self.username = username
         self.broadcast = broadcast
         self.megagroup = megagroup
+        self.usernames = usernames
+
+
+class FakePublicUsername:
+    def __init__(self, username, *, active=True):
+        self.username = username
+        self.active = active
 
 
 class FakeMessage:
@@ -75,7 +90,10 @@ class FakeTelegramClient:
         async def messages():
             if entity.username in self.history_error_by_username:
                 raise self.history_error_by_username[entity.username]
-            for message in self.histories[entity.username]:
+            history = self.histories.get(entity)
+            if history is None:
+                history = self.histories[entity.username]
+            for message in history:
                 self.seen_messages.append((entity.username, message.id))
                 yield message
 
@@ -83,6 +101,76 @@ class FakeTelegramClient:
 
 
 class TelegramCollectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_uses_matching_active_alternate_username_for_public_channel(self):
+        settings = Settings(123, "hash", "https://api.example.test/v1", "key", "model")
+        point = datetime(2026, 8, 10, 12, tzinfo=UTC)
+        entity = FakeEntity(
+            title="News",
+            username=None,
+            usernames=[
+                FakePublicUsername("OtherAlias"),
+                FakePublicUsername("RequestedAlias"),
+            ],
+        )
+        client = FakeTelegramClient(
+            {"requestedalias": entity},
+            {entity: [FakeMessage(7, point, "alternate username post")]},
+        )
+
+        try:
+            posts = await collect_posts(
+                Path("/tmp/digest-root"),
+                settings,
+                ["requestedalias"],
+                point,
+                point,
+                client_factory=lambda *args: client,
+            )
+        except CollectionError as error:
+            self.fail(f"matching active alternate username must be accepted: {error}")
+
+        self.assertEqual(
+            posts,
+            [
+                Post(
+                    "News",
+                    "RequestedAlias",
+                    point,
+                    "https://t.me/RequestedAlias/7",
+                    "alternate username post",
+                )
+            ],
+        )
+        self.assertEqual(client.events, ["start", "resolve:requestedalias", "disconnect"])
+
+    async def test_rejects_inactive_or_unrelated_alternate_usernames(self):
+        settings = Settings(123, "hash", "https://api.example.test/v1", "key", "model")
+        point = datetime(2026, 8, 10, 12, tzinfo=UTC)
+        invalid_aliases = (
+            [FakePublicUsername("requestedalias", active=False)],
+            [FakePublicUsername("differentalias")],
+        )
+
+        for aliases in invalid_aliases:
+            with self.subTest(aliases=[alias.username for alias in aliases]):
+                entity = FakeEntity(title="News", username=None, usernames=aliases)
+                client = FakeTelegramClient({"requestedalias": entity}, {entity: []})
+
+                with self.assertRaises(CollectionError):
+                    await collect_posts(
+                        Path("/tmp/digest-root"),
+                        settings,
+                        ["requestedalias"],
+                        point,
+                        point,
+                        client_factory=lambda *args: client,
+                    )
+
+                self.assertEqual(
+                    client.events,
+                    ["start", "resolve:requestedalias", "disconnect"],
+                )
+
     async def test_collects_utc_window_with_lifecycle_urls_and_deterministic_order(self):
         root = Path("/tmp/digest-root")
         settings = Settings(123, "hash", "https://api.example.test/v1", "key", "model")

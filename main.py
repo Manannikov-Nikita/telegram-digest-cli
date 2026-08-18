@@ -188,7 +188,10 @@ def _telegram_client_factory() -> Callable[..., object]:
     return TelegramClient
 
 
-def _public_broadcast_details(entity: object) -> tuple[str, str]:
+def _public_broadcast_details(
+    entity: object,
+    requested_username: str,
+) -> tuple[str, str]:
     title = getattr(entity, "title", None)
     username = getattr(entity, "username", None)
     if (
@@ -196,9 +199,21 @@ def _public_broadcast_details(entity: object) -> tuple[str, str]:
         or getattr(entity, "megagroup", False)
         or not isinstance(title, str)
         or not title.strip()
-        or not isinstance(username, str)
-        or not username.strip()
     ):
+        raise CollectionError("Source is not a public broadcast channel")
+
+    if not isinstance(username, str) or not username.strip():
+        for alias in getattr(entity, "usernames", None) or ():
+            alias_username = getattr(alias, "username", None)
+            if (
+                getattr(alias, "active", False)
+                and isinstance(alias_username, str)
+                and alias_username.strip()
+                and alias_username.casefold() == requested_username.casefold()
+            ):
+                username = alias_username
+                break
+    if not isinstance(username, str) or not username.strip():
         raise CollectionError("Source is not a public broadcast channel")
     return title, username
 
@@ -220,7 +235,10 @@ async def collect_posts(
         await client.start()
         for requested_username in usernames:
             entity = await client.get_entity(requested_username)
-            title, resolved_username = _public_broadcast_details(entity)
+            title, resolved_username = _public_broadcast_details(
+                entity,
+                requested_username,
+            )
             async for message in client.iter_messages(entity):
                 published_at = message.date.astimezone(timezone.utc)
                 if published_at > as_of:
