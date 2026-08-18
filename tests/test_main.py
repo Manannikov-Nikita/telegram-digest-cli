@@ -327,7 +327,7 @@ class ChannelParsingTests(unittest.TestCase):
         self.assertEqual(usernames, ["News", "Second"])
 
     def test_rejects_malformed_at_handles_with_their_line_number(self):
-        for value in ("@", "@@news", "@news extra", "@news/42", "news"):
+        for value in ("@", "@@news", "@news extra", "@news/42", "@news ", "@news\t", "news"):
             with self.subTest(value=value):
                 with self.assertRaisesRegex(ConfigError, r"Invalid channel source on line 2"):
                     parse_channel_urls(f"@Valid\n{value}\n")

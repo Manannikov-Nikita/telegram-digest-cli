@@ -134,10 +134,11 @@ def parse_channel_urls(text: str) -> list[str]:
     seen: set[str] = set()
     for number, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
+        source = raw_line.lstrip()
         if not line or line.startswith("#"):
             continue
-        if line.startswith("@"):
-            username = line[1:]
+        if source.startswith("@"):
+            username = source[1:]
             valid = bool(USERNAME_RE.fullmatch(username))
         else:
             try:
